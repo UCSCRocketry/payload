@@ -1,0 +1,5 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "arduino-library")(type "KiCad")(uri "/Users/jonathanmorris/Downloads/arduino-library.kicad_sym")(options "")(descr ""))
+  (lib (name "Drone Schematic-eagle-import")(type "KiCad")(uri "${KIPRJMOD}/Drone Schematic-eagle-import.kicad_sym")(options "")(descr ""))
+)
