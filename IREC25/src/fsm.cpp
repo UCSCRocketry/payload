@@ -9,6 +9,12 @@
 // ========== PROGRAM SETTINGS ==========
 const bool enableSerial = true;
 const int EJECT_DELAY = 500;
+const float LAUNCH_THRESHOLD = 15.0;
+const float APOGEE_THRESHOLD = -1.0;
+
+const float L_MOTOR_INIT_POS = 0.0;
+const float R_MOTOR_INIT_POS = 0.0;
+
 // ========== STATE DEFINITIONS ==========
 enum State
 {
@@ -20,9 +26,9 @@ enum State
 State state = IDLE;
 
 
-
 // ========== PIN DEFINITIONS ==========
-#define ENC_CS_PIN 10
+#define ENC_L_CS_PIN 1
+#define ENC_R_CS_PIN 2
 #define SD_CS_PIN 4
 
 // ========== IMU ==========
@@ -32,19 +38,26 @@ float previousAz = 0;
 float roll = 0.0;
 unsigned long lastRollUpdate = 0;
 
-// ========== ACCELERATION THRESHOLDS ==========
-const float LAUNCH_THRESHOLD = 15.0;
-const float APOGEE_THRESHOLD = -1.0;
-
 // ========== MOTOR SETUP ==========
-BLDCMotor motor1 = BLDCMotor(7);
-BLDCDriver6PWM driver1 = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
+BLDCMotor m_l = BLDCMotor(7);
+BLDCDriver6PWM driver_l = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
 
-BLDCMotor motor2 = BLDCMotor(7);
-BLDCDriver6PWM driver2 = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
+BLDCMotor m_r = BLDCMotor(7);
+BLDCDriver6PWM driver_r = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
 
 // ========== ENCODERS ==========
-uint16_t readAngle();
+float zero_off_l = 0.0;
+float l_prev_angle = L_MOTOR_INIT_POS;
+float l_integrated = L_MOTOR_INIT_POS;
+float current_l_angle = L_MOTOR_INIT_POS;
+MagneticSensorSPI enc_l = MagneticSensorSPI(AS5047_SPI, ENC_L_CS_PIN);
+
+float zero_off_r = 0.0;
+float r_prev_angle = R_MOTOR_INIT_POS;
+float r_integrated = R_MOTOR_INIT_POS;
+float current_r_angle = R_MOTOR_INIT_POS;
+MagneticSensorSPI enc_r = MagneticSensorSPI(AS5047_SPI, ENC_R_CS_PIN);
+
 
 // ========== SD LOGGING ==========
 File myFile;
@@ -56,6 +69,10 @@ bool enableLogging = true;
 
 // ========== FLAGS ==========
 bool finsDeployed = false;
+bool ejectTimerStarted = false;
+
+// ========== MISC ==========
+unsigned long ejectStartTime = 0;
 
 // ===== Function: Print Debug Messages =====
 void log(String msg)
@@ -107,6 +124,27 @@ void initSD()
     }
 }
 
+void updateIntegratedAngles() {
+    current_l_angle = enc_l.getAngle();
+    current_r_angle = enc_r.getAngle();
+
+    float delta_l = current_l_angle - l_prev_angle;
+    if (delta_l > _PI)
+        delta_l -= 2 * _PI;
+    if (delta_l < -_PI)
+        delta_l += 2 * _PI;
+    l_integrated += delta_l;
+    l_prev_angle = current_l_angle;
+
+    float delta_r = current_r_angle - r_prev_angle;
+    if (delta_r > _PI)
+        delta_r -= 2 * _PI;
+    if (delta_r < -_PI)
+        delta_r += 2 * _PI;
+    r_integrated += delta_r;
+    r_prev_angle = current_r_angle;
+}
+
 void setup()
 {
     Serial.begin(9600);
@@ -121,31 +159,37 @@ void setup()
         while (1)
             ;
     }
-
+    
+    enc_l.init();
+    enc_r.init();
     SPI.begin();
-    pinMode(ENC_CS_PIN, OUTPUT);
-    digitalWrite(ENC_CS_PIN, HIGH);
 
     initSD();
 
-    driver1.voltage_power_supply = 5.0;
-    driver1.init();
-    motor1.linkDriver(&driver1);
-    motor1.init();
-    motor1.initFOC();
+    driver_l.voltage_power_supply = 5.0;
+    driver_l.init();
+    m_l.linkDriver(&driver_l);
+    m_l.linkSensor(&enc_l);
+    m_l.init();
+    m_l.initFOC();
 
-    driver2.voltage_power_supply = 5.0;
-    driver2.init();
-    motor2.linkDriver(&driver2);
-    motor2.init();
-    motor2.initFOC();
+    driver_r.voltage_power_supply = 5.0;
+    driver_r.init();
+    m_r.linkDriver(&driver_r);
+    m_r.linkSensor(&enc_r);
+    m_r.init();
+    m_r.initFOC();
 
-    motor1.move(0);
-    motor2.move(0);
+    m_l.target = L_MOTOR_INIT_POS;
+    m_r.target = R_MOTOR_INIT_POS;
+
+    m_l.move(0);
+    m_r.move(0);
 }
 
 void loop()
 {
+    updateIntegratedAngles();
     static unsigned long lastLogTime = 0;
 
     if (IMU.accelerationAvailable())
@@ -164,7 +208,7 @@ void loop()
         if (az > LAUNCH_THRESHOLD)
         {
             state = LAUNCH;
-            Serial.println("State: LAUNCH");
+            log("State: LAUNCH");
         }
         break;
 
@@ -172,29 +216,53 @@ void loop()
         if (previousAz > 0 && az < APOGEE_THRESHOLD)
         {
             state = APOGEE;
-            Serial.println("State: APOGEE");
+            log("State: APOGEE");
         }
         break;
 
     case APOGEE:
         if (!finsDeployed)
         {
-            motor1.target = 10.0 * _PI / 180.0;
-            motor2.target = 10.0 * _PI / 180.0;
-            motor1.move();
-            motor2.move();
-            delay(EJECT_DELAY);
-            finsDeployed = true;
-            state = DESCENT;
-            Serial.println("State: DESCENT");
+            // Start the timer once
+            if (!ejectTimerStarted)
+            {
+                // Store current zero offset and start timer
+                zero_off_l = l_integrated;
+                zero_off_r = r_integrated;
+
+                // Move motors to 10 deg relative from current
+                m_l.target = zero_off_l + 10.0 * _PI / 180.0;
+                m_r.target = zero_off_r + 10.0 * _PI / 180.0;
+                m_l.move();
+                m_r.move();
+
+                ejectStartTime = millis();
+                ejectTimerStarted = true;
+            }
+
+            // Check if delay period passed without blocking
+            if (millis() - ejectStartTime >= EJECT_DELAY)
+            {
+                finsDeployed = true;
+                state = DESCENT;
+                log("State: DESCENT");
+
+                // Reset timer flag for future use (if needed)
+                ejectTimerStarted = false;
+            }
         }
         break;
 
     case DESCENT:
         float roll = getRollFromIMU();
         float correction = -roll * 0.05;
-        motor1.move(correction);
-        motor2.move(-correction);
+
+        // Adjust motors relative to their zero
+        m_l.target = zero_off_l + correction;
+        m_r.target = zero_off_r - correction;
+
+        m_l.move();
+        m_r.move();
         break;
     }
 
@@ -206,24 +274,8 @@ void loop()
         logData();
     }
 
-    motor1.loopFOC();
-    motor2.loopFOC();
-}
-
-// ===== Rotary Encoder Read Function =====
-uint16_t readAngle()
-{
-    digitalWrite(ENC_CS_PIN, LOW);
-    SPI.transfer16(0xFFFF);
-    digitalWrite(ENC_CS_PIN, HIGH);
-
-    delayMicroseconds(1);
-
-    digitalWrite(ENC_CS_PIN, LOW);
-    uint16_t result = SPI.transfer16(0xFFFF);
-    digitalWrite(ENC_CS_PIN, HIGH);
-
-    return result & 0x3FFF;
+    m_l.loopFOC();
+    m_r.loopFOC();
 }
 
 // ===== Logging Function =====
@@ -231,9 +283,6 @@ void logData()
 {
     if (!sdInitialized || !fileCreated)
         return;
-
-    uint16_t enc1 = readAngle();
-    uint16_t enc2 = readAngle();
 
     myFile = SD.open(filename, FILE_WRITE);
     if (myFile)
@@ -254,13 +303,13 @@ void logData()
         myFile.print(",");
         myFile.print(gz, 2);
         myFile.print(",");
-        myFile.print(enc1);
+        myFile.print(current_l_angle);
         myFile.print(",");
-        myFile.print(enc2);
+        myFile.print(current_r_angle);
         myFile.print(",");
-        myFile.print(motor1.target);
+        myFile.print(m_l.target);
         myFile.print(",");
-        myFile.println(motor2.target);
+        myFile.println(m_r.target);
         myFile.close();
     }
 }
