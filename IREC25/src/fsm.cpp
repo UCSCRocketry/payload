@@ -3,17 +3,20 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Servo.h>
-#include <Arduino_LSM9DS1.h>
 #include <SimpleFOC.h>
 
 // ========== PROGRAM SETTINGS ==========
 const bool enableSerial = true;
+bool enableLogging = true;
 const int EJECT_DELAY = 500;
 const float LAUNCH_THRESHOLD = 15.0;
 const float APOGEE_THRESHOLD = -1.0;
+const int LOG_DELAY = 100;
 
 const float L_MOTOR_INIT_POS = 0.0;
 const float R_MOTOR_INIT_POS = 0.0;
+
+const float UNLOCK_FIN_POS = 10.0;
 
 // ========== STATE DEFINITIONS ==========
 enum State
@@ -29,11 +32,17 @@ State state = IDLE;
 // ========== PIN DEFINITIONS ==========
 #define ENC_L_CS_PIN 1
 #define ENC_R_CS_PIN 2
-#define SD_CS_PIN 4
+#define SD_CS_PIN BUILTIN_SDCARD
 
 // ========== IMU ==========
-float ax, ay, az;
-float gx, gy, gz;
+struct IMUData
+{
+    float ax, ay, az;
+    float gx, gy, gz;
+};
+
+IMUData data_imu;
+constexpr uint8_t SLAVE_ADDR = 0x10;
 float previousAz = 0;
 float roll = 0.0;
 unsigned long lastRollUpdate = 0;
@@ -58,14 +67,12 @@ float r_integrated = R_MOTOR_INIT_POS;
 float current_r_angle = R_MOTOR_INIT_POS;
 MagneticSensorSPI enc_r = MagneticSensorSPI(AS5047_SPI, ENC_R_CS_PIN);
 
-
 // ========== SD LOGGING ==========
 File myFile;
 int fileIndex = 0;
 char filename[20];
 bool sdInitialized = false;
 bool fileCreated = false;
-bool enableLogging = true;
 
 // ========== FLAGS ==========
 bool finsDeployed = false;
@@ -74,7 +81,6 @@ bool ejectTimerStarted = false;
 // ========== MISC ==========
 unsigned long ejectStartTime = 0;
 
-// ===== Function: Print Debug Messages =====
 void log(String msg)
 {
     if(enableSerial) {
@@ -108,7 +114,7 @@ void initSD()
         if (myFile)
         {
             myFile.println("===DATA START===");
-            myFile.println("Time,State,AX,AY,AZ,GX,GY,GZ,Enc1,Enc2,M1PWM,M2PWM");
+            myFile.println("Time,State,AX,AY,AZ,GX,GY,GZ,Enc1,Enc2,M1,M2");
             myFile.close();
             fileCreated = true;
             log("Writing to " + String(filename));
@@ -145,24 +151,30 @@ void updateIntegratedAngles() {
     r_prev_angle = current_r_angle;
 }
 
+// ===== Request IMU Data =====
+void requestIMUData()
+{
+    data_imu = IMUData();
+    Wire.requestFrom(SLAVE_ADDR, sizeof(IMUData));
+    Wire.readBytes(reinterpret_cast<char *>(&data_imu), sizeof(IMUData));
+}
+
 void setup()
 {
-    Serial.begin(9600);
+    if (enableSerial) {
+        Serial.begin(9600);
+    }
+
     while (enableSerial && !Serial)
         ;
 
     delay(100);
 
-    if (!IMU.begin())
-    {
-        Serial.println("Failed to initialize IMU!");
-        while (1)
-            ;
-    }
     
     enc_l.init();
     enc_r.init();
     SPI.begin();
+    Wire.begin();
 
     initSD();
 
@@ -190,22 +202,13 @@ void setup()
 void loop()
 {
     updateIntegratedAngles();
+    requestIMUData();
     static unsigned long lastLogTime = 0;
-
-    if (IMU.accelerationAvailable())
-    {
-        IMU.readAcceleration(ax, ay, az);
-    }
-
-    if (IMU.gyroscopeAvailable())
-    {
-        IMU.readGyroscope(gx, gy, gz);
-    }
 
     switch (state)
     {
     case IDLE:
-        if (az > LAUNCH_THRESHOLD)
+        if (data_imu.az > LAUNCH_THRESHOLD)
         {
             state = LAUNCH;
             log("State: LAUNCH");
@@ -213,7 +216,7 @@ void loop()
         break;
 
     case LAUNCH:
-        if (previousAz > 0 && az < APOGEE_THRESHOLD)
+        if (previousAz > 0 && data_imu.az < APOGEE_THRESHOLD)
         {
             state = APOGEE;
             log("State: APOGEE");
@@ -223,16 +226,13 @@ void loop()
     case APOGEE:
         if (!finsDeployed)
         {
-            // Start the timer once
             if (!ejectTimerStarted)
             {
-                // Store current zero offset and start timer
                 zero_off_l = l_integrated;
                 zero_off_r = r_integrated;
 
-                // Move motors to 10 deg relative from current
-                m_l.target = zero_off_l + 10.0 * _PI / 180.0;
-                m_r.target = zero_off_r + 10.0 * _PI / 180.0;
+                m_l.target = zero_off_l + UNLOCK_FIN_POS * _PI / 180.0;
+                m_r.target = zero_off_r + UNLOCK_FIN_POS * _PI / 180.0;
                 m_l.move();
                 m_r.move();
 
@@ -240,24 +240,21 @@ void loop()
                 ejectTimerStarted = true;
             }
 
-            // Check if delay period passed without blocking
             if (millis() - ejectStartTime >= EJECT_DELAY)
             {
                 finsDeployed = true;
                 state = DESCENT;
                 log("State: DESCENT");
 
-                // Reset timer flag for future use (if needed)
                 ejectTimerStarted = false;
             }
         }
         break;
 
     case DESCENT:
-        float roll = getRollFromIMU();
+        float roll = data_imu.ay;
         float correction = -roll * 0.05;
 
-        // Adjust motors relative to their zero
         m_l.target = zero_off_l + correction;
         m_r.target = zero_off_r - correction;
 
@@ -266,9 +263,9 @@ void loop()
         break;
     }
 
-    previousAz = az;
+    previousAz = data_imu.az;
 
-    if (millis() - lastLogTime > 100)
+    if (millis() - lastLogTime > LOG_DELAY)
     {
         lastLogTime = millis();
         logData();
@@ -291,17 +288,17 @@ void logData()
         myFile.print(",");
         myFile.print(state);
         myFile.print(",");
-        myFile.print(ax, 2);
+        myFile.print(data_imu.ax, 2);
         myFile.print(",");
-        myFile.print(ay, 2);
+        myFile.print(data_imu.ay, 2);
         myFile.print(",");
-        myFile.print(az, 2);
+        myFile.print(data_imu.az, 2);
         myFile.print(",");
-        myFile.print(gx, 2);
+        myFile.print(data_imu.gx, 2);
         myFile.print(",");
-        myFile.print(gy, 2);
+        myFile.print(data_imu.gy, 2);
         myFile.print(",");
-        myFile.print(gz, 2);
+        myFile.print(data_imu.gz, 2);
         myFile.print(",");
         myFile.print(current_l_angle);
         myFile.print(",");
@@ -312,34 +309,4 @@ void logData()
         myFile.println(m_r.target);
         myFile.close();
     }
-}
-
-// ===== Calculate Roll from IMU =====
-float getRollFromIMU()
-{
-    static const float alpha = 0.98;
-    unsigned long now = millis();
-    float dt = (now - lastRollUpdate) / 1000.0;
-    if (dt <= 0.0 || dt > 1.0)
-        dt = 0.01; // clamp if first call or jump
-    lastRollUpdate = now;
-
-    float axTemp, ayTemp, azTemp;
-    float gxTemp, gyTemp, gzTemp;
-
-    if (IMU.accelerationAvailable())
-        IMU.readAcceleration(axTemp, ayTemp, azTemp);
-    if (IMU.gyroscopeAvailable())
-        IMU.readGyroscope(gxTemp, gyTemp, gzTemp);
-
-    // Gyroscope gxTemp is in degrees/sec — convert to rad/sec
-    float gyroRollRate = gxTemp * PI / 180.0;
-
-    // Accelerometer roll (absolute) in radians
-    float accelRoll = atan2(ayTemp, azTemp);
-
-    // Complementary filter
-    roll = alpha * (roll + gyroRollRate * dt) + (1.0 - alpha) * accelRoll;
-
-    return roll;
 }
