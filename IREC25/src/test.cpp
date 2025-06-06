@@ -1,12 +1,13 @@
 #include <Arduino.h>
 #include <math.h>
-#include <SPI.h>
+#include <Wire.h>
 
 float target_position1 = 0.0f; // radians
 float target_position2 = 0.0f;
 
 const float Kp_position = 5.0f; // tune this experimentally
 
+constexpr uint8_t SLAVE_ADDR = 0x08;
 
 // === Motor 1 Phase Pins ===
 const int AH1 = 2, AL1 = 3;
@@ -18,12 +19,9 @@ const int AH2 = 7, AL2 = 8;
 const int BH2 = 10, BL2 = 12;
 const int CH2 = 14, CL2 = 15;
 
-// === Encoder CS Pins ===
-const int ENC1_CS = 10;
-const int ENC2_CS = 10;
+
 
 // === Encoder Setup ===
-SPIClass &SPI_ENCODERS = SPI1;
 int revolutions1 = 0, revolutions2 = 0;
 uint16_t prev_raw1 = 0, prev_raw2 = 0;
 float full_angle1 = 0.0f, full_angle2 = 0.0f;
@@ -46,16 +44,59 @@ int direction = 1;
 unsigned long lastControl = 0;
 unsigned long lastSwitch = 0;
 float dt = 0.0001f; // default 100 µs
+uint16_t raw_1;
+uint16_t raw_2;
+float ax = 0, ay = 0, az = 0;
+float gx = 0, gy = 0, gz = 0;
 
-// == Setup ENC ===
-void setupEncoders()
+const float ENC_TO_RAD = TWO_PI / 16384.0f;
+
+char imuBuffer[100];
+
+void requestIMUData()
 {
-    pinMode(ENC1_CS, OUTPUT);
-    pinMode(ENC2_CS, OUTPUT);
-    digitalWrite(ENC1_CS, HIGH);
-    digitalWrite(ENC2_CS, HIGH);
+    memset(imuBuffer, 0, sizeof(imuBuffer)); // Clear buffer
 
-    SPI_ENCODERS.begin();
+    Wire.requestFrom(SLAVE_ADDR, sizeof(imuBuffer));
+    int i = 0;
+    while (Wire.available() && i < sizeof(imuBuffer) - 1)
+    {
+        imuBuffer[i++] = Wire.read();
+    }
+    imuBuffer[i] = '\0'; // Null-terminate
+
+
+
+    // Parse floats and integers from the string
+    int parsed = sscanf(imuBuffer,
+                        "ax=%f,ay=%f,az=%f,gx=%f,gy=%f,gz=%f,e1=%hu,e2=%hu",
+                        &ax, &ay, &az, &gx, &gy, &gz, &raw_1, &raw_2);
+
+    // Optional: Check if all 8 fields were successfully parsed
+    if (parsed == 8)
+    {
+        // Do something with the parsed values
+        Serial.print("AX: ");
+        Serial.print(ax);
+        Serial.print(" AY: ");
+        Serial.print(ay);
+        Serial.print(" AZ: ");
+        Serial.print(az);
+        Serial.print(" GX: ");
+        Serial.print(gx);
+        Serial.print(" GY: ");
+        Serial.print(gy);
+        Serial.print(" GZ: ");
+        Serial.print(gz);
+        Serial.print(" ENC1: ");
+        Serial.print(raw_1);
+        Serial.print(" ENC2: ");
+        Serial.println(raw_2);
+    }
+    else
+    {
+        Serial.println("Failed to parse IMU string.");
+    }
 }
 
 // === Setup PWM ===
@@ -66,29 +107,7 @@ void setupPWM(int pin)
     analogWriteResolution(pwmRes);
 }
 
-// === ENC Read ==
-uint16_t readAS5047D(int csPin)
-{
-    uint16_t command = 0x3FFF; // Read angle command (16-bit, parity checked optional)
 
-    digitalWrite(csPin, LOW);
-    delayMicroseconds(1);
-    SPI_ENCODERS.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1)); // up to 10 MHz, MODE1
-
-    SPI_ENCODERS.transfer16(command); // throwaway read (AS5047D requires two reads)
-
-    digitalWrite(csPin, HIGH);
-    delayMicroseconds(1);
-
-    digitalWrite(csPin, LOW);
-    delayMicroseconds(1);
-    uint16_t result = SPI_ENCODERS.transfer16(0x0000); // actual angle read
-    digitalWrite(csPin, HIGH);
-
-    SPI_ENCODERS.endTransaction();
-
-    return result & 0x3FFF; // 14-bit angle
-}
 
 // === SVPWM ===
 void applySVPWM(int AH, int AL, int BH, int BL, int CH, int CL, float angle, float amplitude)
@@ -123,22 +142,22 @@ void applySVPWM(int AH, int AL, int BH, int BL, int CH, int CL, float angle, flo
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial)
-        ;
+    while (!Serial);
 
     int pins[] = {AH1, AL1, BH1, BL1, CH1, CL1, AH2, AL2, BH2, BL2, CH2, CL2};
     for (int i = 0; i < 12; i++)
         setupPWM(pins[i]);
 
-    setupEncoders();
 
     lastSwitch = millis();
     Serial.println("SVPWM Dual Motor Oscillator Ready!");
+    delay(100);
 }
 
 void loop()
 {
     unsigned long now = micros();
+    requestIMUData();
 
     if (millis() - lastSwitch >= swing_time)
     {
@@ -173,29 +192,29 @@ void loop()
 
         current_velocity1 += constrain(delta_vel1, -max_step, max_step);
         current_velocity2 += constrain(delta_vel2, -max_step, max_step);
-        uint16_t angle_raw1 = readAS5047D(ENC1_CS);
-        uint16_t angle_raw2 = readAS5047D(ENC2_CS);
 
+        
+        
         // === Track wraparounds ===
-        int16_t delta1 = angle_raw1 - prev_raw1;
+        int16_t delta1 = raw_1 - prev_raw1;
         if (delta1 > 8192)
             revolutions1--; // Wrapped backwards
         else if (delta1 < -8192)
             revolutions1++; // Wrapped forward
 
-        int16_t delta2 = angle_raw2 - prev_raw2;
+        int16_t delta2 = raw_2 - prev_raw2;
         if (delta2 > 8192)
             revolutions2--;
         else if (delta2 < -8192)
             revolutions2++;
 
-        // === Compute full mechanical angles in radians ===
-        full_angle1 = ((float)revolutions1 + (float)angle_raw1 / 16384.0f) * TWO_PI;
-        full_angle2 = ((float)revolutions2 + (float)angle_raw2 / 16384.0f) * TWO_PI;
 
         // Save previous readings
-        prev_raw1 = angle_raw1;
-        prev_raw2 = angle_raw2;
+        prev_raw1 = raw_1;
+        prev_raw2 = raw_2;
+
+        full_angle1 = (revolutions1 * 16384 + raw_1) * ENC_TO_RAD;
+        full_angle2 = (revolutions2 * 16384 + raw_2) * ENC_TO_RAD;
 
         // === Compute electrical angle (assume pole pairs = 1, adjust if not) ===
         float electrical_angle1 = fmodf(full_angle1 * 7 + 0.05f * current_velocity1, TWO_PI);

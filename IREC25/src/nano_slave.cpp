@@ -1,108 +1,92 @@
-#include <Arduino_LSM9DS1.h>
 #include <Wire.h>
+#include <SPI.h>
+#include "Arduino_BMI270_BMM150.h"
 
-// I2C Slave Address
-#define I2C_SLAVE_ADDRESS 0x10
+const byte SLAVE_ADDR = 0x08;
+char imuString[64];
 
-const bool enableSerial = true;
+// === Encoder CS Pins ===
+const int ENC1_CS = 10; // PINK SIDE
+const int ENC2_CS = 8;  // RED SIDE
 
-// IMU Data Struct
-struct IMUData
+SPIClass &SPI_ENCODERS = SPI;
+
+// === Setup Encoders ===
+void setupEncoders()
 {
-    float ax, ay, az; // Accelerometer
-    float gx, gy, gz; // Gyroscope
-};
+    pinMode(ENC1_CS, OUTPUT);
+    pinMode(ENC2_CS, OUTPUT);
+    digitalWrite(ENC1_CS, HIGH);
+    digitalWrite(ENC2_CS, HIGH);
 
-class MovingAverageFilter
-{
-    float *buffer;
-    int size, index;
-    float sum;
-
-public:
-    MovingAverageFilter(int size = 5) : size(size), index(0), sum(0.0f)
-    {
-        buffer = new float[size]();
-    }
-
-    ~MovingAverageFilter()
-    {
-        delete[] buffer;
-    }
-
-    float filter(float value)
-    {
-        sum -= buffer[index];
-        buffer[index] = value;
-        sum += value;
-        index = (index + 1) % size;
-        return sum / size;
-    }
-};
-
-MovingAverageFilter axFilt, ayFilt, azFilt;
-MovingAverageFilter gxFilt, gyFilt, gzFilt;
-
-IMUData imuData;
-
-uint8_t *getIMUBytes()
-{
-    static uint8_t buf[sizeof(IMUData)];
-    memcpy(buf, &imuData, sizeof(IMUData));
-    return buf;
+    SPI_ENCODERS.begin();
 }
 
-void onRequest()
+// === Read AS5047D via SPI ===
+uint16_t readAS5047D(int csPin)
 {
-    uint8_t *data = getIMUBytes();
-    Wire.write(data, sizeof(IMUData));
+    uint16_t command = 0x3FFF; // Read angle command
+    uint16_t nop = 0xFFFF;
+
+    SPI_ENCODERS.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE1));
+
+    // First read: send 0x3FFF to request angle
+    digitalWrite(csPin, LOW);
+    delayMicroseconds(1);
+    SPI_ENCODERS.transfer16(command);
+    digitalWrite(csPin, HIGH);
+    delayMicroseconds(1);
+
+    // Second read: retrieve the result of the last command
+    digitalWrite(csPin, LOW);
+    delayMicroseconds(1);
+    uint16_t result = SPI_ENCODERS.transfer16(nop);
+    digitalWrite(csPin, HIGH);
+
+    SPI_ENCODERS.endTransaction();
+
+    return result & 0x3FFF; // Return 14-bit angle
 }
 
-void log(String msg)
+// === I2C Send Handler ===
+void sendIMUString()
 {
-    if (enableSerial)
-    {
-        Serial.println(msg);
-    }
+    Wire.write(imuString);
 }
 
 void setup()
 {
-    if (enableSerial) {
-        Serial.begin(115200);
-    }
+    Serial.begin(115200);
+    Wire.begin(SLAVE_ADDR);
+    Wire.onRequest(sendIMUString);
 
-    Wire.begin(I2C_SLAVE_ADDRESS);
-    Wire.onRequest(onRequest);
+    setupEncoders();
 
     if (!IMU.begin())
     {
-        log("Failed to initialize IMU!");
-        while (1)
-            ;
+        Serial.println("We fucked");
+        while (1);
     }
-
-    log("IMU initialized, I2C ready");
 }
 
 void loop()
 {
-    float ax, ay, az;
-    float gx, gy, gz;
+    float ax = 0, ay = 0, az = 0;
+    float gx = 0, gy = 0, gz = 0;
 
-    if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable())
-    {
+    if (IMU.accelerationAvailable()) {
         IMU.readAcceleration(ax, ay, az);
+    }
+    if (IMU.gyroscopeAvailable()) {
         IMU.readGyroscope(gx, gy, gz);
-
-        imuData.ax = axFilt.filter(ax);
-        imuData.ay = ayFilt.filter(ay);
-        imuData.az = azFilt.filter(az);
-
-        imuData.gx = gxFilt.filter(gx);
-        imuData.gy = gyFilt.filter(gy);
-        imuData.gz = gzFilt.filter(gz);
     }
 
-    delay(10);
+    uint16_t angle1 = readAS5047D(ENC1_CS);
+    uint16_t angle2 = readAS5047D(ENC2_CS);
+
+    snprintf(imuString, sizeof(imuString),
+             "ax=%.1f,ay=%.1f,az=%.1f,gx=%.1f,gy=%.1f,gz=%.1f,e1=%u,e2=%u",
+             ax, ay, az, gx, gy, gz, angle1, angle2);
+
+    delay(50);
 }

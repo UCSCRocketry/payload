@@ -2,8 +2,6 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
-#include <Servo.h>
-#include <SimpleFOC.h>
 
 // ========== PROGRAM SETTINGS ==========
 const bool enableSerial = true;
@@ -12,6 +10,7 @@ const int EJECT_DELAY = 500;
 const float LAUNCH_THRESHOLD = 15.0;
 const float APOGEE_THRESHOLD = -1.0;
 const int LOG_DELAY = 100;
+const int IMU_DELAY = 50;
 
 const float L_MOTOR_INIT_POS = 0.0;
 const float R_MOTOR_INIT_POS = 0.0;
@@ -35,37 +34,24 @@ State state = IDLE;
 #define SD_CS_PIN BUILTIN_SDCARD
 
 // ========== IMU ==========
-struct IMUData
+struct __attribute__((packed)) IMUData
 {
     float ax, ay, az;
     float gx, gy, gz;
 };
 
 IMUData data_imu;
-constexpr uint8_t SLAVE_ADDR = 0x10;
+constexpr uint8_t SLAVE_ADDR = 0x08;
 float previousAz = 0;
 float roll = 0.0;
 unsigned long lastRollUpdate = 0;
 
-// ========== MOTOR SETUP ==========
-BLDCMotor m_l = BLDCMotor(7);
-BLDCDriver6PWM driver_l = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
+char imuBuffer[100];
 
-BLDCMotor m_r = BLDCMotor(7);
-BLDCDriver6PWM driver_r = BLDCDriver6PWM(5, 6, 9, 10, 3, 11);
+// ========== MOTOR SETUP ==========
 
 // ========== ENCODERS ==========
-float zero_off_l = 0.0;
-float l_prev_angle = L_MOTOR_INIT_POS;
-float l_integrated = L_MOTOR_INIT_POS;
-float current_l_angle = L_MOTOR_INIT_POS;
-MagneticSensorSPI enc_l = MagneticSensorSPI(AS5047_SPI, ENC_L_CS_PIN);
 
-float zero_off_r = 0.0;
-float r_prev_angle = R_MOTOR_INIT_POS;
-float r_integrated = R_MOTOR_INIT_POS;
-float current_r_angle = R_MOTOR_INIT_POS;
-MagneticSensorSPI enc_r = MagneticSensorSPI(AS5047_SPI, ENC_R_CS_PIN);
 
 // ========== SD LOGGING ==========
 File myFile;
@@ -86,6 +72,24 @@ void log(String msg)
     if(enableSerial) {
         Serial.println(msg);
     }
+}
+
+float parseFloatValue(const char *str, const char *key)
+{
+    const char *found = strstr(str, key);
+    if (!found)
+        return 0.0f;
+    return atof(found + strlen(key));
+}
+
+String formatIMUData(const IMUData &d)
+{
+    return "Accel: ax=" + String(d.ax, 3) +
+           " ay=" + String(d.ay, 3) +
+           " az=" + String(d.az, 3) +
+           " | Gyro: gx=" + String(d.gx, 3) +
+           " gy=" + String(d.gy, 3) +
+           " gz=" + String(d.gz, 3);
 }
 
 // ===== Count Existing Log Files =====
@@ -130,154 +134,115 @@ void initSD()
     }
 }
 
-void updateIntegratedAngles() {
-    current_l_angle = enc_l.getAngle();
-    current_r_angle = enc_r.getAngle();
-
-    float delta_l = current_l_angle - l_prev_angle;
-    if (delta_l > _PI)
-        delta_l -= 2 * _PI;
-    if (delta_l < -_PI)
-        delta_l += 2 * _PI;
-    l_integrated += delta_l;
-    l_prev_angle = current_l_angle;
-
-    float delta_r = current_r_angle - r_prev_angle;
-    if (delta_r > _PI)
-        delta_r -= 2 * _PI;
-    if (delta_r < -_PI)
-        delta_r += 2 * _PI;
-    r_integrated += delta_r;
-    r_prev_angle = current_r_angle;
-}
 
 // ===== Request IMU Data =====
 void requestIMUData()
 {
-    data_imu = IMUData();
-    Wire.requestFrom(SLAVE_ADDR, sizeof(IMUData));
-    Wire.readBytes(reinterpret_cast<char *>(&data_imu), sizeof(IMUData));
+    memset(imuBuffer, 0, sizeof(imuBuffer)); // Clear buffer
+
+    Wire.requestFrom(SLAVE_ADDR, sizeof(imuBuffer));
+    int i = 0;
+    while (Wire.available() && i < sizeof(imuBuffer) - 1)
+    {
+        imuBuffer[i++] = Wire.read();
+    }
+    imuBuffer[i] = '\0'; // Null-terminate
+
+    // Parse floats from the string buffer
+    data_imu.ax = parseFloatValue(imuBuffer, "ax=");
+    data_imu.ay = parseFloatValue(imuBuffer, "ay=");
+    data_imu.az = parseFloatValue(imuBuffer, "az=");
+    data_imu.gx = parseFloatValue(imuBuffer, "gx=");
+    data_imu.gy = parseFloatValue(imuBuffer, "gy=");
+    data_imu.gz = parseFloatValue(imuBuffer, "gz=");
+
 }
+
+void logData();
 
 void setup()
 {
     if (enableSerial) {
         Serial.begin(9600);
-    }
-
-    while (enableSerial && !Serial)
-        ;
-
-    delay(100);
-
-    
-    enc_l.init();
-    enc_r.init();
-    SPI.begin();
+        while(!Serial);
+    }   
     Wire.begin();
-
-    initSD();
-
-    driver_l.voltage_power_supply = 5.0;
-    driver_l.init();
-    m_l.linkDriver(&driver_l);
-    m_l.linkSensor(&enc_l);
-    m_l.init();
-    m_l.initFOC();
-
-    driver_r.voltage_power_supply = 5.0;
-    driver_r.init();
-    m_r.linkDriver(&driver_r);
-    m_r.linkSensor(&enc_r);
-    m_r.init();
-    m_r.initFOC();
-
-    m_l.target = L_MOTOR_INIT_POS;
-    m_r.target = R_MOTOR_INIT_POS;
-
-    m_l.move(0);
-    m_r.move(0);
+    delay(100);
+   
 }
 
 void loop()
 {
-    updateIntegratedAngles();
-    requestIMUData();
     static unsigned long lastLogTime = 0;
+    static unsigned long lastIMURequestTime = 0;
 
     switch (state)
     {
-    case IDLE:
-        if (data_imu.az > LAUNCH_THRESHOLD)
-        {
-            state = LAUNCH;
-            log("State: LAUNCH");
-        }
-        break;
-
-    case LAUNCH:
-        if (previousAz > 0 && data_imu.az < APOGEE_THRESHOLD)
-        {
-            state = APOGEE;
-            log("State: APOGEE");
-        }
-        break;
-
-    case APOGEE:
-        if (!finsDeployed)
-        {
-            if (!ejectTimerStarted)
+        case IDLE:
+            if (data_imu.az > LAUNCH_THRESHOLD)
             {
-                zero_off_l = l_integrated;
-                zero_off_r = r_integrated;
-
-                m_l.target = zero_off_l + UNLOCK_FIN_POS * _PI / 180.0;
-                m_r.target = zero_off_r + UNLOCK_FIN_POS * _PI / 180.0;
-                m_l.move();
-                m_r.move();
-
-                ejectStartTime = millis();
-                ejectTimerStarted = true;
+                state = LAUNCH;
+                log("State: LAUNCH");
             }
+            break;
 
-            if (millis() - ejectStartTime >= EJECT_DELAY)
+        case LAUNCH:
+            if (previousAz > 0 && data_imu.az < APOGEE_THRESHOLD)
             {
-                finsDeployed = true;
-                state = DESCENT;
-                log("State: DESCENT");
-
-                ejectTimerStarted = false;
+                state = APOGEE;
+                log("State: APOGEE");
             }
-        }
-        break;
+            break;
 
-    case DESCENT:
-        float roll = data_imu.ay;
-        float correction = -roll * 0.05;
+        case APOGEE:
+            if (!finsDeployed)
+            {
+                if (!ejectTimerStarted)
+                {
+                    ejectStartTime = millis();
+                    ejectTimerStarted = true;
+                }
 
-        m_l.target = zero_off_l + correction;
-        m_r.target = zero_off_r - correction;
+                if (millis() - ejectStartTime >= EJECT_DELAY)
+                {
+                    finsDeployed = true;
+                    state = DESCENT;
+                    log("State: DESCENT");
 
-        m_l.move();
-        m_r.move();
-        break;
+                    ejectTimerStarted = false;
+                }
+            }
+            break;
+
+        case DESCENT:
+            float roll = data_imu.ay;
+            float correction = -roll * 0.05;
+
+            break;
     }
 
     previousAz = data_imu.az;
 
-    if (millis() - lastLogTime > LOG_DELAY)
+    uint32_t now = millis();
+
+    if (now - lastIMURequestTime > IMU_DELAY)
     {
-        lastLogTime = millis();
-        logData();
+        requestIMUData();
+        lastIMURequestTime = now; // Update IMU request timer
     }
 
-    m_l.loopFOC();
-    m_r.loopFOC();
+    if (now - lastLogTime > LOG_DELAY)
+    {
+        lastLogTime = now; // Update logging timer
+        logData();
+    }
 }
 
 // ===== Logging Function =====
 void logData()
 {
+    log(formatIMUData(data_imu));
+
     if (!sdInitialized || !fileCreated)
         return;
 
@@ -300,13 +265,14 @@ void logData()
         myFile.print(",");
         myFile.print(data_imu.gz, 2);
         myFile.print(",");
-        myFile.print(current_l_angle);
+        // myFile.print(current_l_angle);
         myFile.print(",");
-        myFile.print(current_r_angle);
+        // myFile.print(current_r_angle);
         myFile.print(",");
-        myFile.print(m_l.target);
+        // myFile.print(m_l.target);
         myFile.print(",");
-        myFile.println(m_r.target);
+        // myFile.println(m_r.target);
         myFile.close();
     }
+    
 }
